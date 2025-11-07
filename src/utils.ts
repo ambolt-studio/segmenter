@@ -6,7 +6,6 @@ export function ensurePayload(obj: any) {
   const text = (typeof obj?.text === "string" ? obj.text.trim() : "");
   const parsedDoc = obj?.parsed_document || obj?.document || obj;
   
-  // Check if it's a parsed bank statement document
   if (parsedDoc && (parsedDoc.pages || parsedDoc.chunks)) {
     return { 
       html, 
@@ -52,6 +51,7 @@ export type Chunk = {
     credit_columns?: string[];
     date_column?: string;
     description_column?: string;
+    transaction_count?: number;
   };
 };
 
@@ -59,62 +59,94 @@ export function extractFromParsedDocument(parsedDoc: any, max: number) {
   const chunks: Chunk[] = [];
   let idx = 1;
   
-  // Extract bank name from labels or content
   const bankName = parsedDoc.labels?.bank || 
                    detectBankName(JSON.stringify(parsedDoc).substring(0, 5000));
   
-  // Process pages with fragments
   if (parsedDoc.pages && Array.isArray(parsedDoc.pages)) {
     for (const page of parsedDoc.pages) {
       if (!page.page_fragments) continue;
       
-      // Group fragments by type and process tables specially
-      const tables: any[] = [];
-      const texts: any[] = [];
+      const allFragments = page.page_fragments
+        .sort((a: any, b: any) => a.reading_order - b.reading_order);
       
-      for (const fragment of page.page_fragments) {
+      let pageContent = "";
+      let pageMetadata: any = {
+        has_transactions: false,
+        debit_columns: [],
+        credit_columns: [],
+        date_column: null,
+        description_column: null,
+        transaction_count: 0
+      };
+      
+      for (const fragment of allFragments) {
         if (fragment.fragment_type === "table") {
-          tables.push(fragment);
+          const tableContent = fragment.content?.content || fragment.content?.markdown || "";
+          const tableMeta = analyzeTableStructure(fragment.content?.cells || [], tableContent);
+          
+          if (tableMeta.has_transactions) {
+            pageMetadata.has_transactions = true;
+            pageMetadata.debit_columns = [...new Set([...pageMetadata.debit_columns, ...tableMeta.debit_columns])];
+            pageMetadata.credit_columns = [...new Set([...pageMetadata.credit_columns, ...tableMeta.credit_columns])];
+            if (tableMeta.date_column) pageMetadata.date_column = tableMeta.date_column;
+            if (tableMeta.description_column) pageMetadata.description_column = tableMeta.description_column;
+            
+            const transactionLines = tableContent.split('\n').filter((line: string) => 
+              /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{1,2}[\/\-]\d{1,2})/i.test(line)
+            );
+            pageMetadata.transaction_count += transactionLines.length;
+          }
+          
+          pageContent += "\n\n### TABLE ###\n" + tableContent;
         } else if (fragment.fragment_type === "text") {
-          texts.push(fragment);
+          const textContent = fragment.content?.content || "";
+          if (textContent.trim()) {
+            pageContent += "\n" + textContent;
+          }
         }
       }
       
-      // Process non-table text
-      const nonTableText = texts
-        .sort((a, b) => a.reading_order - b.reading_order)
-        .map(f => f.content?.content || "")
-        .join("\n")
-        .trim();
+      pageContent = pageContent.trim();
       
-      if (nonTableText) {
-        for (const seg of chunkify(nonTableText, max)) {
-          chunks.push({
-            bank_name: bankName,
-            chunk_id: `chunk_${idx}`,
-            chunk_number: idx,
-            char_len: seg.length,
-            has_table: false,
-            chunk_text: seg
-          });
-          idx++;
-        }
-      }
-      
-      // Process tables with transaction intelligence
-      for (const table of tables) {
-        const tableChunks = processTableFragment(table, idx, max, bankName);
+      if (pageContent.length <= max) {
+        chunks.push({
+          bank_name: bankName,
+          chunk_id: `chunk_${idx}`,
+          chunk_number: idx,
+          char_len: pageContent.length,
+          has_table: pageMetadata.has_transactions,
+          chunk_text: pageContent,
+          metadata: pageMetadata
+        });
+        idx++;
+      } else {
+        const tableChunks = splitLargePageContent(pageContent, max, bankName, idx, pageMetadata);
         chunks.push(...tableChunks);
         idx += tableChunks.length;
       }
     }
   }
   
-  // Fallback: process chunks if pages aren't available
   if (chunks.length === 0 && parsedDoc.chunks && Array.isArray(parsedDoc.chunks)) {
+    let consolidatedContent = "";
+    
     for (const chunk of parsedDoc.chunks) {
-      const content = chunk.content || "";
-      for (const seg of chunkify(content, max)) {
+      consolidatedContent += "\n\n" + (chunk.content || "");
+    }
+    
+    consolidatedContent = consolidatedContent.trim();
+    
+    if (consolidatedContent.length <= max) {
+      chunks.push({
+        bank_name: bankName,
+        chunk_id: `chunk_${idx}`,
+        chunk_number: idx,
+        char_len: consolidatedContent.length,
+        has_table: /\|.*\|/.test(consolidatedContent) || /\t/.test(consolidatedContent),
+        chunk_text: consolidatedContent
+      });
+    } else {
+      for (const seg of chunkify(consolidatedContent, max)) {
         chunks.push({
           bank_name: bankName,
           chunk_id: `chunk_${idx}`,
@@ -128,7 +160,6 @@ export function extractFromParsedDocument(parsedDoc: any, max: number) {
     }
   }
   
-  // Add total_chunks to all chunks
   const totalChunks = chunks.length;
   chunks.forEach(c => c.total_chunks = totalChunks);
   
@@ -141,49 +172,42 @@ export function extractFromParsedDocument(parsedDoc: any, max: number) {
   };
 }
 
-function processTableFragment(table: any, startIdx: number, max: number, bankName: string): Chunk[] {
+function splitLargePageContent(content: string, max: number, bankName: string, startIdx: number, metadata: any): Chunk[] {
   const chunks: Chunk[] = [];
   let idx = startIdx;
   
-  // Parse table structure
-  const cells = table.content?.cells || [];
-  const markdown = table.content?.markdown || "";
-  const content = table.content?.content || markdown;
+  const sections = content.split(/### TABLE ###/).filter(s => s.trim());
   
-  // Detect column types
-  const metadata = analyzeTableStructure(cells, content);
+  let buffer = "";
   
-  // Split table into transaction groups
-  const transactionGroups = splitTableByTransactions(content, metadata);
-  
-  for (const group of transactionGroups) {
-    // Don't split transactions across chunks
-    if (group.length <= max) {
+  for (const section of sections) {
+    if (buffer.length > 0 && (buffer.length + section.length) > max) {
       chunks.push({
         bank_name: bankName,
         chunk_id: `chunk_${idx}`,
         chunk_number: idx,
-        char_len: group.length,
-        has_table: true,
-        chunk_text: group,
-        metadata
+        char_len: buffer.length,
+        has_table: /\|/.test(buffer) || metadata.has_transactions,
+        chunk_text: buffer.trim(),
+        metadata: metadata
       });
       idx++;
+      buffer = section;
     } else {
-      // If a single transaction group is too large, chunk it carefully
-      for (const seg of chunkify(group, max)) {
-        chunks.push({
-          bank_name: bankName,
-          chunk_id: `chunk_${idx}`,
-          chunk_number: idx,
-          char_len: seg.length,
-          has_table: true,
-          chunk_text: seg,
-          metadata
-        });
-        idx++;
-      }
+      buffer += "\n\n" + section;
     }
+  }
+  
+  if (buffer.trim()) {
+    chunks.push({
+      bank_name: bankName,
+      chunk_id: `chunk_${idx}`,
+      chunk_number: idx,
+      char_len: buffer.length,
+      has_table: /\|/.test(buffer) || metadata.has_transactions,
+      chunk_text: buffer.trim(),
+      metadata: metadata
+    });
   }
   
   return chunks;
@@ -198,12 +222,10 @@ function analyzeTableStructure(cells: any[], content: string): any {
     description_column: null
   };
   
-  // Look for headers in cells
   const headerTexts = cells
     .filter(c => c.text)
     .map(c => c.text.toLowerCase());
   
-  // Detect column types from headers
   for (const text of headerTexts) {
     if (/date/i.test(text)) {
       metadata.date_column = text;
@@ -222,77 +244,11 @@ function analyzeTableStructure(cells: any[], content: string): any {
     }
   }
   
-  // Also check content for common patterns
   if (/debits.*credits|withdrawals.*deposits/i.test(content)) {
     metadata.has_transactions = true;
   }
   
   return metadata;
-}
-
-function splitTableByTransactions(content: string, metadata: any): string[] {
-  if (!metadata.has_transactions) {
-    return [content];
-  }
-  
-  const lines = content.split('\n');
-  const groups: string[] = [];
-  let currentGroup: string[] = [];
-  let headerLines: string[] = [];
-  
-  // Find header rows
-  for (let i = 0; i < Math.min(5, lines.length); i++) {
-    const line = lines[i];
-    if (/date|description|amount|debit|credit/i.test(line)) {
-      headerLines.push(line);
-    } else {
-      break;
-    }
-  }
-  
-  const startDataIdx = headerLines.length;
-  
-  // Process data rows
-  for (let i = startDataIdx; i < lines.length; i++) {
-    const line = lines[i];
-    
-    // Check if this looks like a transaction row (has date pattern)
-    const isTransactionRow = /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{1,2}[\/\-]\d{1,2})/i.test(line);
-    const isEmpty = !line.trim() || /^[\|\-\s]+$/.test(line);
-    
-    if (isEmpty && currentGroup.length > 0) {
-      // Empty line might separate transactions
-      const groupText = [...headerLines, ...currentGroup].join('\n');
-      if (groupText.trim()) {
-        groups.push(groupText);
-      }
-      currentGroup = [];
-    } else if (isTransactionRow) {
-      // Start of a new transaction - flush previous
-      if (currentGroup.length > 0) {
-        const groupText = [...headerLines, ...currentGroup].join('\n');
-        if (groupText.trim()) {
-          groups.push(groupText);
-        }
-      }
-      currentGroup = [line];
-    } else if (currentGroup.length > 0) {
-      // Continuation of current transaction
-      currentGroup.push(line);
-    } else {
-      currentGroup.push(line);
-    }
-  }
-  
-  // Flush remaining
-  if (currentGroup.length > 0) {
-    const groupText = [...headerLines, ...currentGroup].join('\n');
-    if (groupText.trim()) {
-      groups.push(groupText);
-    }
-  }
-  
-  return groups.length > 0 ? groups : [content];
 }
 
 export function extractFromHtml(html: string, max: number) {
@@ -404,7 +360,7 @@ export function splitTableLikeBlocks(text: string): Block[] {
   let buf: string[] = [];
 
   const isTableRow = (line: string): boolean => {
-    if (/^\s*\d{2}[\/-]\d{2}(?:[\/-]\d{2,4})?\s+/i.test(line)) return true;
+    if (/^\s*\d{2}[\/\-]\d{2}(?:[\/\-]\d{2,4})?\s+/i.test(line)) return true;
     if (/\t/.test(line)) return true;
     if (/(\s{2,}[^\s]+\s{2,}[^\s]+)/.test(line)) return true;
     if (/^\s*(DATE|DESCRIPTION|AMOUNT)\b/i.test(line)) return true;
