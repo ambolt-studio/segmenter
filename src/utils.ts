@@ -42,6 +42,7 @@ export type Chunk = {
   chunk_id: string;
   chunk_number: number;
   total_chunks?: number;
+  page_range?: string;
   char_len: number;
   has_table: boolean;
   chunk_text: string;
@@ -63,7 +64,21 @@ export function extractFromParsedDocument(parsedDoc: any, max: number) {
                    detectBankName(JSON.stringify(parsedDoc).substring(0, 5000));
   
   if (parsedDoc.pages && Array.isArray(parsedDoc.pages)) {
-    for (const page of parsedDoc.pages) {
+    // NEW STRATEGY: Consolidate multiple pages into chunks
+    let currentChunkContent = "";
+    let currentChunkMetadata: any = {
+      has_transactions: false,
+      debit_columns: [],
+      credit_columns: [],
+      date_column: null,
+      description_column: null,
+      transaction_count: 0
+    };
+    let startPageNum = 1;
+    let endPageNum = 1;
+    
+    for (let pageIdx = 0; pageIdx < parsedDoc.pages.length; pageIdx++) {
+      const page = parsedDoc.pages[pageIdx];
       if (!page.page_fragments) continue;
       
       const allFragments = page.page_fragments
@@ -79,6 +94,7 @@ export function extractFromParsedDocument(parsedDoc: any, max: number) {
         transaction_count: 0
       };
       
+      // Extract all content from page
       for (const fragment of allFragments) {
         if (fragment.fragment_type === "table") {
           const tableContent = fragment.content?.content || fragment.content?.markdown || "";
@@ -100,7 +116,7 @@ export function extractFromParsedDocument(parsedDoc: any, max: number) {
           pageContent += "\n\n### TABLE ###\n" + tableContent;
         } else if (fragment.fragment_type === "text") {
           const textContent = fragment.content?.content || "";
-          if (textContent.trim()) {
+          if (textContent.trim() && !isPageFooterOrHeader(textContent)) {
             pageContent += "\n" + textContent;
           }
         }
@@ -108,25 +124,61 @@ export function extractFromParsedDocument(parsedDoc: any, max: number) {
       
       pageContent = pageContent.trim();
       
-      if (pageContent.length <= max) {
+      // Check if adding this page would exceed max size
+      const wouldExceedMax = (currentChunkContent.length + pageContent.length) > max;
+      const isLastPage = pageIdx === parsedDoc.pages.length - 1;
+      
+      if (currentChunkContent.length === 0) {
+        // First page of new chunk
+        currentChunkContent = pageContent;
+        currentChunkMetadata = pageMetadata;
+        startPageNum = page.page_number || pageIdx + 1;
+        endPageNum = page.page_number || pageIdx + 1;
+      } else if (!wouldExceedMax) {
+        // Add page to current chunk
+        currentChunkContent += "\n\n--- PAGE BREAK ---\n\n" + pageContent;
+        endPageNum = page.page_number || pageIdx + 1;
+        
+        // Merge metadata
+        mergeMetadata(currentChunkMetadata, pageMetadata);
+      } else {
+        // Current page would exceed max, flush current chunk
         chunks.push({
           bank_name: bankName,
           chunk_id: `chunk_${idx}`,
           chunk_number: idx,
-          char_len: pageContent.length,
-          has_table: pageMetadata.has_transactions,
-          chunk_text: pageContent,
-          metadata: pageMetadata
+          page_range: startPageNum === endPageNum ? `${startPageNum}` : `${startPageNum}-${endPageNum}`,
+          char_len: currentChunkContent.length,
+          has_table: currentChunkMetadata.has_transactions,
+          chunk_text: currentChunkContent,
+          metadata: currentChunkMetadata
         });
         idx++;
-      } else {
-        const tableChunks = splitLargePageContent(pageContent, max, bankName, idx, pageMetadata);
-        chunks.push(...tableChunks);
-        idx += tableChunks.length;
+        
+        // Start new chunk with current page
+        currentChunkContent = pageContent;
+        currentChunkMetadata = pageMetadata;
+        startPageNum = page.page_number || pageIdx + 1;
+        endPageNum = page.page_number || pageIdx + 1;
+      }
+      
+      // Flush last chunk if this is the last page
+      if (isLastPage && currentChunkContent.trim()) {
+        chunks.push({
+          bank_name: bankName,
+          chunk_id: `chunk_${idx}`,
+          chunk_number: idx,
+          page_range: startPageNum === endPageNum ? `${startPageNum}` : `${startPageNum}-${endPageNum}`,
+          char_len: currentChunkContent.length,
+          has_table: currentChunkMetadata.has_transactions,
+          chunk_text: currentChunkContent,
+          metadata: currentChunkMetadata
+        });
       }
     }
   }
   
+  // Fallback: use pre-existing chunks from document
   if (chunks.length === 0 && parsedDoc.chunks && Array.isArray(parsedDoc.chunks)) {
     let consolidatedContent = "";
     
@@ -160,6 +212,7 @@ export function extractFromParsedDocument(parsedDoc: any, max: number) {
     }
   }
   
+  // Add total_chunks to all chunks
   const totalChunks = chunks.length;
   chunks.forEach(c => c.total_chunks = totalChunks);
   
@@ -172,45 +225,37 @@ export function extractFromParsedDocument(parsedDoc: any, max: number) {
   };
 }
 
-function splitLargePageContent(content: string, max: number, bankName: string, startIdx: number, metadata: any): Chunk[] {
-  const chunks: Chunk[] = [];
-  let idx = startIdx;
-  
-  const sections = content.split(/### TABLE ###/).filter(s => s.trim());
-  
-  let buffer = "";
-  
-  for (const section of sections) {
-    if (buffer.length > 0 && (buffer.length + section.length) > max) {
-      chunks.push({
-        bank_name: bankName,
-        chunk_id: `chunk_${idx}`,
-        chunk_number: idx,
-        char_len: buffer.length,
-        has_table: /\|/.test(buffer) || metadata.has_transactions,
-        chunk_text: buffer.trim(),
-        metadata: metadata
-      });
-      idx++;
-      buffer = section;
-    } else {
-      buffer += "\n\n" + section;
-    }
+function mergeMetadata(target: any, source: any) {
+  if (source.has_transactions) {
+    target.has_transactions = true;
   }
-  
-  if (buffer.trim()) {
-    chunks.push({
-      bank_name: bankName,
-      chunk_id: `chunk_${idx}`,
-      chunk_number: idx,
-      char_len: buffer.length,
-      has_table: /\|/.test(buffer) || metadata.has_transactions,
-      chunk_text: buffer.trim(),
-      metadata: metadata
-    });
+  target.debit_columns = [...new Set([...target.debit_columns, ...source.debit_columns])];
+  target.credit_columns = [...new Set([...target.credit_columns, ...source.credit_columns])];
+  if (source.date_column && !target.date_column) {
+    target.date_column = source.date_column;
   }
+  if (source.description_column && !target.description_column) {
+    target.description_column = source.description_column;
+  }
+  target.transaction_count += source.transaction_count;
+}
+
+function isPageFooterOrHeader(text: string): boolean {
+  const lines = text.trim().split('\n');
+  if (lines.length > 3) return false; // Headers/footers are usually 1-3 lines
   
-  return chunks;
+  const content = text.toLowerCase();
+  
+  // Common footer/header patterns
+  if (/page \d+ of \d+/i.test(content)) return true;
+  if (/^\d+ of \d+$/i.test(content.trim())) return true;
+  if (/member fdic/i.test(content)) return true;
+  if (/continued on next page/i.test(content)) return true;
+  if (/^statement date:/i.test(content)) return true;
+  if (/^account number:/i.test(content)) return true;
+  if (/^\d{4} \d{7} \d{4}-\d{4}/i.test(content)) return true; // Document codes
+  
+  return false;
 }
 
 function analyzeTableStructure(cells: any[], content: string): any {
