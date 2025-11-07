@@ -3,5 +3,5 @@ export const BANK_NAMES: string[] = [
   "Citibank","Citi","Capital One","U.S. Bank","Navy Federal","Ally Bank",
   "TD Bank","Santander","BBVA","Mercury","Wise","Revolut","Valley Bank",
   "OceanFirst","HSBC","Regions Bank","Huntington","BMO","First Republic",
-  "Fifth Third","Comerica","KeyBank","M&T Bank"
+  "Fifth Third","Comerica","KeyBank","M&T Bank","Amerant","AMERANT"
 ];
